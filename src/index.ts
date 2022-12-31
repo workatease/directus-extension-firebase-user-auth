@@ -3,9 +3,9 @@ import { UserRecord } from 'firebase-admin/lib/auth/user-record';
 import jwt from 'jsonwebtoken';
 import { Accountability } from '@directus/shared/types';
 const admin = require('firebase-admin');
-//import admin from 'firebase-admin';
+//import admin, { FirebaseError } from 'firebase-admin';
 
-export default defineHook(({ filter, action }, { env, exceptions }) => {
+export default defineHook(({ filter, action }, { env, exceptions, logger }) => {
 	const { InvalidCredentialsException } = exceptions;
 	const app = admin.apps.length ? admin.app() : admin.initializeApp({
 		credential: admin.credential.cert(
@@ -18,16 +18,14 @@ export default defineHook(({ filter, action }, { env, exceptions }) => {
 	});
 
 	filter('authenticate', async (defaultAccountability, meta, { database }) => {
-		// console.log('filter -- authenticate');
 		const { req } = meta;
 		if (!req.token) return defaultAccountability; // No token,  return default
-		if(isDirectusJWT(req.token)) return defaultAccountability; // Directus token, return default
+		if (isDirectusJWT(req.token)) return defaultAccountability; // Directus token, return default
 		if (isFirebaseJWT(req.token)) {
-			// console.log('isFirebaseJWT');
+			logger.info('Firebase token authenticated started');
 			try {
-				const accountability = Object.assign({},defaultAccountability) as Accountability;
+				const accountability = Object.assign({}, defaultAccountability) as Accountability;
 				const decodedToken = await app.auth().verifyIdToken(req.token);
-				// console.log('decodedToken',decodedToken);
 				const user = await database
 					.select('directus_users.id', 'directus_users.role', 'directus_roles.admin_access', 'directus_roles.app_access')
 					.from('directus_users')
@@ -37,33 +35,29 @@ export default defineHook(({ filter, action }, { env, exceptions }) => {
 						status: 'active',
 					})
 					.first();
-				// console.log('user',user);
 				if (!user) {
+					logger.error('Firebase token authenticated failed as user not found');
 					throw new InvalidCredentialsException();
 				}
-
 				accountability.user = user.id;
 				accountability.role = user.role;
 				accountability.admin = user.admin_access === true || user.admin_access == 1;
 				accountability.app = user.app_access === true || user.app_access == 1;
-				// console.log('accountability',accountability);
 				return accountability;
-			} catch (error) {
-				console.log(error);
+			} catch (error: any) {
+				logger.error('Firebase token authenticated failed');
+				if (error.message) {
+					logger.error(error.message);
+				} else {
+					logger.error(error);
+				}
+				throw new InvalidCredentialsException();
 			}
-			// console.log('end of isFirebaseJWT');
 		}
-		// console.log('return defaultAccountability');
 		return defaultAccountability;
-
 	});
 
 	action('users.create', (meta) => {
-		console.log('users Item!');
-		console.log(meta);
-		// console.log(accountability);
-		// console.log(database);
-		// console.log(schema);
 		app.auth().createUser({
 			uid: meta.key,
 			email: meta.payload.email,
@@ -72,20 +66,21 @@ export default defineHook(({ filter, action }, { env, exceptions }) => {
 			phoneNumber: meta.payload.mobile,
 			password: meta.payload?.password
 		}).then((userRecord: UserRecord) => {
-			// See the UserRecord reference doc for the contents of userRecord.
-			console.log('Successfully created new user:', userRecord.uid);
-		})
-			.catch((error: any) => {
-				console.log('Error creating new user:', error);
-			});
+			logger.info('Successfully created new user in firebase %s', userRecord.uid);
+		}).catch((error: any) => {
+			if (error.message) {
+				logger.error('Error creating new user in firebase %s - %s', error.message, error.code);
+			} else {
+				logger.error(error);
+			}
+		});
 	});
-	action('users.update', (meta) => {
-		console.log('Updating Item!');
-		console.log(meta);
+
+	action('users.update', async (meta, { database }) => {
 		const { payload } = meta;
 		const { email, mobile, first_name, status } = payload;
 		if (email || mobile || first_name || status) {
-			var user;
+			var user = null;
 			if (email) {
 				user = { email: email };
 			} else if (mobile) {
@@ -97,32 +92,63 @@ export default defineHook(({ filter, action }, { env, exceptions }) => {
 			} else if (status && status !== 'active') {
 				user = { disabled: true };
 			}
-			if (user)
-				app.auth().updateUser(meta.keys[0], user)
-					.then((userRecord: UserRecord) => {
-						// See the UserRecord reference doc for the contents of userRecord.
-						console.log('Successfully updated user:', userRecord.uid);
-					}).catch((error: any) => {
-						console.log('Error updating user:', error);
+			if (user) {
+				try {
+					const updatedUser = await app.auth().updateUser(meta.keys[0], user);
+					logger.info('Successfully updated user in firebase %s', updatedUser.uid);
+				} catch (error: any) {
+					if (error.code === 'auth/user-not-found') {
+						const getCurrentUser = await database
+							.select('id', 'email', 'first_name', 'mobile')
+							.from('directus_users')
+							.where({
+								'directus_users.id': meta.keys[0],
+								status: 'active',
+							})
+							.first();
+						if (getCurrentUser) {
+							try {
+								const updatedUser = await app.auth().createUser({
+									uid: getCurrentUser.id,
+									email: getCurrentUser.email,
+									displayName: getCurrentUser.first_name,
+									disabled: false,
+									phoneNumber: getCurrentUser.mobile
+								});
+								if (updatedUser) {
+									logger.info('Successfully created user in firebase for update user %s', updatedUser.uid);
+								}
+							} catch (error: any) {
+								logger.error('Error in create user in update action');
+								if (error.message) {
+									logger.error('Error in create user in update action %s - %s ', error.message, error.code);
+								} else {
+									logger.error(error);
+								}
+							}
+						} else {
+							logger.error('Firebase token authenticated failed as user not found');
+							throw new InvalidCredentialsException();
+						}
 					}
-					);
+				}
+			}
 		}
-
 	});
+
 	action('users.delete', (meta) => {
-		console.log('Deleting Item!');
-		console.log(meta);
-		app.auth().deleteUsers(meta.keys)
+		app.auth()
+			.deleteUsers(meta.keys)
 			.then(() => {
-				console.log('Successfully deleted user');
+				logger.info('Successfully deleted user in firebase %s', meta.keys[0]);
 			})
 			.catch((error: any) => {
-				console.log('Error deleting user:', error);
+				if (error.message) {
+					logger.error('Error deleting user in firebase %s - %s', error.message, error.code);
+				} else {
+					logger.error(error);
+				}
 			});
-
-		// console.log(accountability);
-		// console.log(database);
-		// console.log(schema);
 	});
 
 	function isDirectusJWT(string: string): boolean {
